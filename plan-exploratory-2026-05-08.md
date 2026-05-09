@@ -1,0 +1,500 @@
+# Plan: exploratory-2026-05-08 — Teacher iMessage Bulk Messenger
+
+> version: v5 · created: 2026-05-08 · last-updated: 2026-05-09
+
+> **Authoritative artifact for this ticket's pipeline.**
+> verify and validate read from this file. Previous versions: `plan-exploratory-2026-05-08.v1.md`, `plan-exploratory-2026-05-08.v2.md`, `plan-exploratory-2026-05-08.v3.md`, `plan-exploratory-2026-05-08.v4.md`.
+
+---
+
+## Part 1: Spec
+
+### Context
+
+- **Core problem:** A teacher needs to send personalized iMessage/SMS messages to 50+ contacts weekly from her Mac. Contacts must be extractable to a spreadsheet for management. Each recipient needs a custom greeting. Recipients span iMessage (Apple), SMS (Android/generic). Delivery must be confirmable per recipient type.
+- **Constraints:** macOS Tahoe (16) — confirmed. Tahoe compatibility with `osascript` → Messages.app scripting is unverified at this macOS version and must be validated during the POC phase. No dependencies pre-installed beyond Claude Code; a dedicated onboarding script must configure the full environment from scratch. Either AppleScript or Python acceptable. Weekly recurring use — reliability and repeatability are the top priorities.
+- **Success metrics:** All 50+ contacts receive their personalized message each week. iMessage recipients show `is_delivered = 1` in delivery log. SMS recipients show `is_delivered = 1` (carrier-level). Script runs without human intervention after initial setup. Teacher can trigger the full workflow via a single Claude Code skill invocation.
+- **Scope boundaries:**
+  - **In scope:** Contact CSV export/management; onboarding/installation script (`setup.sh`); phone number normalization to E.164; service type auto-detection from `chat.db`; message template file; Python CLI to send personalized messages via Messages.app; delivery log from `chat.db`; Claude Code skill `/imessage-blast`.
+  - **Out of scope:** Group chats; message scheduling/queuing for future dates; third-party app integration (LoopMessage, StraightText); attachments; read-receipt enforcement (recipient opt-in required).
+  - **Must-have:** Onboarding script (installs all deps, creates directory structure, guides permissions setup); phone number normalization to E.164; service type auto-detection from `chat.db`; message template file (edited weekly by teacher); personalization (custom greeting per recipient); one-at-a-time sends (never group/bulk); delivery log; retry log for failed sends.
+  - **Nice-to-have:** Dry-run preview mode, active/inactive flag per contact.
+- **Risk tolerance:** Low disruption preferred. Script must not risk Apple ID suspension. Must recover gracefully from send failures without stopping the full batch. Teacher should not need to use Terminal after initial setup.
+- **Existing evidence:** No prior tooling exists in the repo. All components must be built from scratch.
+- **Scope disposition:** POC-first — prove that `osascript` can send one personalized iMessage and one SMS from Python on macOS Tahoe, and that `chat.db` delivers confirmation, before building the full CLI and skill.
+
+---
+
+### Research
+
+#### Internal Patterns
+
+**Existing messaging scripts/skills**
+- No dedicated messaging or iMessage scripts found in `~/.claude/skills/` or `~/workspace/` — all messaging components must be built from scratch.
+- No AppleScript or `osascript` wrappers for Messages.app automation exist anywhere in the config.
+
+**Existing contact management tooling**
+- One contacts database reference found (`contacts_polaris.db` in Dropbox instance) but no extraction or import scripts exist around it.
+- No CSV/spreadsheet contact management utilities in place.
+
+**Relevant AppleScript or Python patterns found**
+- `config_loader.py` in `~/.claude/plugins/hookify/` demonstrates dataclass-based config patterns with `@classmethod` factory validation — reusable pattern for CSV row parsing.
+- `~/.claude/plugins/skill-creator` shows skill scaffolding conventions.
+
+**Naming conventions and code style in existing skills**
+- Skills use kebab-case directory names (e.g., `sdlc-feature`, `heuristics-python`).
+- All skills are Markdown-based with YAML frontmatter: `name`, `description`, `allowed-tools`.
+- Python follows `heuristics-python`: Python 3.10+, `dataclasses`, `logging` over `print`, `Click` for CLIs.
+- Skills are pure `.md` specs — no `.py` files embedded in skill directories.
+
+**Gaps (what must be built)**
+- `setup.sh` — onboarding/installation script (Homebrew, Python, deps, directory structure, permissions guidance).
+- Phone number normalization utility (E.164 conversion, used by all scripts).
+- `detect_service.py` — queries `chat.db` `handle` table to auto-populate `service_type` in `contacts.csv`.
+- `osascript` wrapper callable from Python for Messages.app.
+- Contact CSV export guide + schema definition.
+- `message_template.txt` — weekly message body template with `{first_name}` and `{greeting}` placeholders.
+- Python CLI (`send_messages.py`) using Click.
+- Delivery report script querying `chat.db`.
+- Claude Code skill `imessage-blast` as a `.md` spec.
+
+#### External Patterns
+
+**AppleScript Messages.app capabilities and macOS version limitations**
+- Core send pattern works on Ventura/Sonoma/Sequoia but requires explicit Automation permission: `System Settings → Privacy & Security → Automation → Terminal → Messages` must be enabled (one-time setup).
+- **macOS Tahoe (16) compatibility is unverified.** The POC must confirm that `osascript` → Messages.app still functions on Tahoe before full implementation begins. If Tahoe broke the API, the approach must be reconsidered.
+- Sequoia (macOS 15) has new instability for file attachments, but plain text sends remain functional per community reports. Tahoe status unknown.
+- **Existing conversation restriction:** `osascript send` only works reliably when a prior chat thread exists with the recipient. All recipients in this deployment have confirmed existing threads — this restriction is satisfied by design.
+- No AppleScript API exists to detect whether a phone number is iMessage-capable at runtime — detection must come from `chat.db` (see service type auto-detection below).
+- Service routing: `service type = iMessage` vs `service "SMS"` in AppleScript allows conditional logic per recipient.
+
+**Python/programmatic iMessage approaches**
+- `py-iMessage` (PyPI: `py-iMessage`, GitHub: Rolstenhouse) — lightweight `osascript` wrapper. API: `iMessage.send("+15551234567", "Hello Jane")`. Simple, low-maintenance dependency.
+- Direct `subprocess.run(["osascript", "-e", script])` approach avoids all library dependencies entirely and is the most durable against macOS changes.
+- `imsg` CLI (Go binary: `brew install steipete/tap/imsg`) — actively maintained, exposes JSON interface, 99.6% delivery success rate per docs. Higher reliability but adds a Homebrew dependency.
+- `~/Library/Messages/chat.db` is queryable via Python's built-in `sqlite3` with Full Disk Access granted to Terminal. Key columns: `is_delivered`, `is_read`, `date_delivered`, `date_read` in the `message` table.
+- On Ventura+, message body is stored in `attributedBody` as a binary blob — use `text` column for outbound messages sent by the script (not for reading received messages).
+- **Phone number normalization:** Contacts.app stores numbers in mixed formats (local, E.164, with/without dashes). All scripts must normalize to E.164 (`+1XXXXXXXXXX` for US numbers) before any `chat.db` lookup or `osascript` call. Use the `phonenumbers` PyPI library (`pip install phonenumbers`) — it handles all common US formats reliably.
+
+**Service type auto-detection from chat.db**
+- The `chat.db` `handle` table has a `service` column storing `"iMessage"` or `"SMS"` per phone number, derived from actual message history.
+- Query: `SELECT service FROM handle WHERE id = '<normalized_phone>' ORDER BY ROWID DESC LIMIT 1`
+- `detect_service.py` reads `contacts.csv`, runs this query per active contact, and writes the detected value back to the `service_type` column.
+- Requires Full Disk Access (already required by REQ-6 — no new permission).
+- If no handle record exists (contact has no prior thread), detection returns `NULL` — the pre-flight check will catch this anyway.
+- The teacher runs `detect_service.py` once during onboarding and again whenever contacts may have switched devices.
+
+**Contact export methods from macOS Contacts**
+- Native export is vCard only (`.vcf`). No built-in CSV export.
+- Easiest path: Drag contacts from Contacts.app into Numbers → `File → Export To → CSV`. Numbers auto-maps vCard fields to columns.
+- AppleScript can iterate `every person` in Contacts and write a CSV directly — scriptable and automatable.
+- "Exporter for Contacts" app (Mac App Store, ~$4) provides one-click CSV/Excel export — fastest for non-technical setup.
+
+**Delivery confirmation feasibility**
+- `chat.db` `message` table: `is_delivered` (1 = delivered to device), `is_read` (1 = read, only if recipient has "Send Read Receipts" enabled), `date_delivered`, `date_read`.
+- `is_delivered` is reliable for both iMessage and SMS (carrier confirmation). Use this as the primary confirmation signal.
+- `is_read` is unreliable in practice — many users disable "Send Read Receipts." Treat it as bonus signal, not required.
+- SMS has no read receipts at all by protocol — `is_read` will always be 0 for SMS recipients.
+- Post-send query delay: wait 60 seconds after last send before querying `chat.db` to allow delivery signals to propagate.
+
+**Rate limiting and anti-spam considerations**
+- No published Apple rate limits, but community reports show flags triggered by: identical message content, rapid burst sending, lopsided send/receive ratio.
+- Mitigation: 10-second sleep between sends (50 contacts × 10s ≈ 8 minutes/run), personalized content per recipient (the custom greeting requirement already satisfies this).
+- Content uniformity is the biggest flag — varying even just the greeting makes each message distinct enough to avoid detection.
+
+**Recommended approach**
+- `setup.sh` installs Homebrew → Python 3.11 → pip deps → creates directory structure → guides permissions setup interactively.
+- Python CLI using `subprocess` + `osascript` (no library dependency). Read CSV with `csv.DictReader`. Normalize all phone numbers to E.164 via `phonenumbers`. Personalize message body from template file. Route via `service_type` column (auto-detected). Sleep 10 seconds between sends. Auto-retry each failure once after 15-second pause. Post-send: query `chat.db` via `sqlite3` 60 seconds after last send. Write `delivery_report_YYYY-MM-DD.csv`. Wrap everything in a Claude Code skill for weekly invocation.
+
+---
+
+### Requirements
+
+- **REQ-1:** Contacts must be exportable from macOS Contacts app to a CSV with columns: `first_name`, `last_name`, `phone`, `service_type` (imessage/sms), `custom_greeting`, `active`. Phone numbers may be in any format — all scripts must normalize to E.164 before use. — *Research evidence: "Exporter for Contacts" app or Numbers drag method produce a well-structured CSV (External: Contact export methods); mixed phone formats require normalization (External: Phone normalization)*
+- **REQ-2:** `service_type` must be auto-detected from `chat.db` `handle.service` column by `detect_service.py`. The teacher must not need to determine or maintain iMessage vs SMS classification manually. — *Research evidence: `handle` table `service` column provides per-contact service classification from actual message history (External: Service type auto-detection)*
+- **REQ-3:** Each message must be personalized with at minimum the recipient's `custom_greeting` field, making every message body unique. — *Research evidence: Content uniqueness is the primary anti-spam mitigation; uniform content is the main flag trigger (External: Rate limiting)*
+- **REQ-4:** Script must enforce a 10-second delay between sends to stay within safe rate limits. — *Research evidence: 50 contacts × 10s ≈ 8 minutes; empirically safe per community data (External: Rate limiting)*
+- **REQ-5:** Delivery report must be generated by querying `chat.db` for `is_delivered` and `is_read` 60 seconds after the last send. Report must cover all recipient types. — *Research evidence: `chat.db` `message` table provides `is_delivered` for both iMessage and SMS; `is_read` available for iMessage only (External: Delivery confirmation feasibility)*
+- **REQ-6:** Terminal must be granted Full Disk Access and Automation → Messages permissions (one-time setup) before the script can run. `setup.sh` must guide the teacher through both grants with `open` commands to the exact System Settings panes and step-by-step instructions. — *Research evidence: Both permissions required for `chat.db` reads and `osascript` → Messages.app (External: AppleScript limitations)*
+- **REQ-7:** Sending script must support a `--dry-run` flag that previews all messages without sending. — *Research evidence: None in existing tooling (Internal: Gaps); derived from risk tolerance (Context)*
+- **REQ-8:** The script must only process contacts where `active = yes`; contacts with `active = no` must be silently skipped in both pre-flight and sends. This allows the teacher to deactivate a contact without deleting their row. — *Derived from: `active` column in CSV schema; nice-to-have in Context; inferred from gap in original requirements*
+- **REQ-9:** Before any message is sent, the script must run a pre-flight check that queries `chat.db` to confirm an existing conversation thread exists for every active contact in the CSV. If any contact has no thread, the script must halt and print the list of contacts missing threads — no sends occur until all contacts pass. — *Research evidence: Existing conversation restriction confirmed real; silent failures possible without a prior thread (External: AppleScript limitations)*
+- **REQ-10:** Each message must be sent individually to one recipient at a time — no group sends, no multi-recipient `osascript` calls. — *Research evidence: Group chat send via AppleScript has different API and failure modes; individual sends are the intended use case (External: AppleScript capabilities)*
+- **REQ-11:** If an individual send fails (non-zero `osascript` exit or exception), the script must automatically retry that contact once after a 15-second pause. If the retry also fails, the contact must be written to `retry_YYYY-MM-DD.csv` with the error details. After all contacts are processed, the script must print a consolidated list of all contacts that failed after retry. The main batch must continue to the next recipient at all times. — *Derived from: reliability requirement for 50+ weekly sends; user-confirmed retry behavior (Q&A session 2026-05-09)*
+- **REQ-12:** The weekly message body must be read from a template file (`~/messages/message_template.txt`) containing `{first_name}` and `{greeting}` placeholders. The teacher edits this file before each weekly run. The sending script reads the template via `--template PATH` (default: `~/messages/message_template.txt`). — *Derived from: user-confirmed template file preference (Q&A session 2026-05-09)*
+- **REQ-13:** An onboarding script (`~/bin/setup.sh`) must install and configure the full environment from scratch on a stock macOS Tahoe machine with only Claude Code present. It must: install Homebrew, install Python 3.11+, install pip dependencies (`click`, `phonenumbers`), create the `~/messages/logs/` directory structure, create a default `contacts.csv` with headers, create a default `message_template.txt` with placeholder content, and guide the teacher through Full Disk Access and Automation → Messages permission grants. — *Derived from: no dependencies pre-installed; teacher has stock macOS Tahoe + Claude Code only (Q&A session 2026-05-09)*
+- **REQ-14:** All phone numbers must be normalized to E.164 format (`+1XXXXXXXXXX` for US numbers) before any `chat.db` lookup or `osascript` call, using the `phonenumbers` library. Normalization must happen at CSV read time so all downstream code can assume E.164. — *Research evidence: Contacts.app stores numbers in mixed formats; `chat.db` handle lookups are exact-match on the stored format (External: Phone normalization)*
+
+---
+
+### Architecture
+
+**Components:**
+
+```
+setup.sh (one-time onboarding)
+    │  1. install Homebrew → Python 3.11+ → pip deps
+    │  2. create ~/messages/logs/ directory structure
+    │  3. create default contacts.csv + message_template.txt
+    │  4. open System Settings panes + print permission instructions
+    │
+    ▼
+detect_service.py (run once at onboarding, re-run when contacts change devices)
+    │  reads contacts.csv → queries chat.db handle.service per phone
+    │  writes service_type back to contacts.csv
+    │
+    ▼
+contacts.csv (teacher maintains: first_name, last_name, phone, custom_greeting, active)
+message_template.txt (teacher edits weekly)
+    │
+    ▼
+send_messages.py (Python Click CLI)
+    │  0. normalize all phone numbers to E.164 at CSV read time
+    │  1. pre-flight: query chat.db → verify existing thread per active contact
+    │     → HALT + print missing contacts if any fail
+    │  2. for each active contact (one at a time, never grouped):
+    │       → build personalized message from template + contact row
+    │       → osascript → Messages.app
+    │       → success: write to send_log_YYYY-MM-DD.csv (status=sent)
+    │       → failure: wait 15s → retry once
+    │           → retry success: write to send_log (status=sent_after_retry)
+    │           → retry failure: write to retry_YYYY-MM-DD.csv (status=failed, error=<msg>)
+    │       → sleep 10s → next contact
+    │  3. summary: N sent, M failed after retry → print consolidated failure list if M > 0
+    │
+    ├──► Messages.app ──► iMessage (Apple contacts)
+    └──► Messages.app ──► SMS (Android / generic)
+                              │
+                        (60s delay)
+                              │
+delivery_report.py ◄──── chat.db (~/Library/Messages/chat.db)
+    │  queries is_delivered, is_read per recipient
+    │  writes delivery_report_YYYY-MM-DD.csv
+    │
+    ▼
+~/.claude/skills/imessage-blast/SKILL.md
+    orchestrates: service detect (if needed) → CSV check → dry-run preview
+                  → confirm → send → delivery report → retry summary
+```
+
+**File layout:**
+```
+~/bin/
+  setup.sh              # one-time onboarding: installs deps, creates dirs, guides permissions
+  send_messages.py      # Click CLI — sends personalized messages
+  detect_service.py     # queries chat.db to auto-populate service_type in contacts.csv
+  delivery_report.py    # queries chat.db, writes delivery CSV
+
+~/messages/
+  contacts.csv          # teacher-maintained contact list
+  message_template.txt  # weekly message body template (edited before each run)
+  logs/
+    send_YYYY-MM-DD.csv      # per-run send log (successful + attempted)
+    retry_YYYY-MM-DD.csv     # failed contacts after retry — same schema as contacts.csv + error column
+    delivery_YYYY-MM-DD.csv  # per-run delivery report
+
+~/.claude/skills/imessage-blast/
+  SKILL.md              # Claude Code skill spec
+```
+
+**setup.sh** — onboarding script:
+- Checks for Homebrew; installs if missing (`/bin/bash -c "$(curl ...)"`)
+- Installs Python 3.11+ via `brew install python@3.11`
+- Installs pip deps: `pip3 install click phonenumbers`
+- Creates `~/messages/logs/` directory tree
+- Creates `~/messages/contacts.csv` with header row if not present
+- Creates `~/messages/message_template.txt` with placeholder: `{greeting} — [your weekly message here]`
+- Prints: `STEP: Grant Full Disk Access` → runs `open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"` → prints exact checkbox instructions
+- Prints: `STEP: Grant Automation → Messages` → runs `open "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"` → prints exact checkbox instructions
+- Ends with: `Setup complete. Edit ~/messages/contacts.csv and ~/messages/message_template.txt, then run /imessage-blast in Claude Code.`
+
+**detect_service.py** — standalone script:
+- Reads `contacts.csv` (default: `~/messages/contacts.csv`)
+- For each active contact: normalizes phone to E.164 → queries `handle.service` from `chat.db`
+- Updates `service_type` column in-place; writes back to CSV
+- Prints: `Updated: N contacts  |  No thread found: M contacts (check pre-flight)`
+- Can be invoked by the skill or run directly
+
+**send_messages.py** — Click CLI:
+- `--csv PATH` (default: `~/messages/contacts.csv`)
+- `--template PATH` — message body template file with `{first_name}` and `{greeting}` placeholders (default: `~/messages/message_template.txt`)
+- `--dry-run` — print preview, no sends (pre-flight check still runs)
+- `--delay INT` — seconds between sends (default: 10)
+- `--skip-preflight` — bypass pre-flight check (not exposed in skill UI; emergency-only flag)
+- **Normalization phase** (runs first, before pre-flight):
+  - Reads all rows from CSV; normalizes `phone` column to E.164 via `phonenumbers` library
+  - Logs any numbers that cannot be normalized; halts if any active contact has an unparseable number
+- **Pre-flight phase** (runs after normalization, before any send):
+  - Opens `~/Library/Messages/chat.db` via `sqlite3`
+  - For each active contact, queries `handle` table joined to `chat_handle_join` to confirm at least one chat record exists for that phone number
+  - Query: `SELECT COUNT(*) FROM handle h JOIN chat_handle_join chj ON h.ROWID = chj.handle_id WHERE h.id = '<e164_phone>'`
+  - Collects all contacts that return `COUNT = 0`
+  - If any failures: prints `PRE-FLIGHT FAILED — no existing thread for: [name, phone]` per missing contact, exits non-zero without sending
+  - If all pass: prints `Pre-flight OK — N contacts verified` and proceeds
+- Sends to each active contact individually in sequence — one `osascript` call per recipient, never batched
+- **Retry logic:** on failure (non-zero osascript exit or exception): waits 15 seconds → retries once
+  - Retry success: appends row to `send_log_YYYY-MM-DD.csv` with `status=sent_after_retry`
+  - Retry failure: appends row to `retry_YYYY-MM-DD.csv` (same columns as contacts.csv + `error` column); continues to next contact
+- On success (first attempt): appends row to `send_log_YYYY-MM-DD.csv` (`status=sent`)
+- After all contacts processed: prints `Sent: N  Failed after retry: M` summary; if M > 0, prints consolidated list of failed contacts with their errors
+- Sleeps `delay` seconds between contacts (applies after both successes and failures; does not apply during the 15s retry pause)
+- Retry log is directly usable as `--csv` input: `python ~/bin/send_messages.py --csv ~/messages/logs/retry_YYYY-MM-DD.csv ...`
+
+**delivery_report.py** — standalone script:
+- Reads most recent `send_YYYY-MM-DD.csv` from `~/messages/logs/`
+- Waits for `chat.db` signals (called 60s after last send, or invoked manually)
+- Queries `message` table joining on `handle` by normalized phone number
+- Writes `~/messages/logs/delivery_YYYY-MM-DD.csv`: name, phone, service_type, is_delivered, is_read, date_delivered
+
+**contacts.csv schema:**
+```
+first_name,last_name,phone,service_type,custom_greeting,active
+Jane,Smith,+15551234567,imessage,"Hi Jane! Hope you're well —",yes
+Bob,Jones,+15559876543,sms,"Hey Bob! Quick update —",yes
+```
+
+**message_template.txt format:**
+```
+{greeting} [shared weekly message body that the teacher edits before each run]
+```
+
+**retry_YYYY-MM-DD.csv schema** (superset of contacts.csv — usable as direct `--csv` input):
+```
+first_name,last_name,phone,service_type,custom_greeting,active,error
+Jane,Smith,+15551234567,imessage,"Hi Jane! Hope you're well —",yes,"osascript exit 1: Messages not responding"
+```
+
+---
+
+### Acceptance Criteria
+
+1. Running `setup.sh` on a stock macOS Tahoe machine with only Claude Code installs all dependencies, creates the full directory structure, and walks the teacher through permission grants without requiring any Terminal knowledge beyond running the script once.
+2. Running `detect_service.py` populates the `service_type` column in `contacts.csv` from `chat.db` without the teacher needing to know or specify which contacts use iMessage vs SMS.
+3. Phone numbers in any common US format (local, E.164, with/without dashes or parens) are normalized to E.164 before any `chat.db` lookup or `osascript` call.
+4. Running `send_messages.py` with any active contact missing a Messages.app thread halts before sending and prints the list of contacts missing threads.
+5. Running `send_messages.py --dry-run` prints a personalized preview for every active contact using the message template without sending (pre-flight check runs and must pass first).
+6. Contacts with `active = no` are skipped in both pre-flight and sends.
+7. Running `send_messages.py` sends a personalized message to each active contact individually in sequence; a failed send is auto-retried once after 15 seconds — if it still fails, that contact is written to a retry log and the batch continues.
+8. After a run with failures, `retry_YYYY-MM-DD.csv` exists, contains all post-retry failures with error details, and a consolidated failure list was printed at the end of the run.
+9. After a run with failures, `retry_YYYY-MM-DD.csv` can be passed directly as `--csv` input to re-send only the failed contacts.
+10. Running `delivery_report.py` produces a CSV showing `is_delivered` status for every recipient from the most recent send run.
+11. The `/imessage-blast` skill in Claude Code guides the teacher through the weekly workflow (service detect check → CSV check → pre-flight → dry-run → confirm → send → report + failure summary if any) without requiring Terminal knowledge.
+
+---
+
+### Test Plan
+
+| # | Criterion | Verification Method | Command / Steps | Expected Evidence | PASS Condition |
+|---|-----------|--------------------|-----------------|--------------------|----------------|
+| 1 | setup.sh completes cleanly | manual | Run `bash ~/bin/setup.sh` on a fresh machine | All deps installed, dirs created, permission panes opened | exit 0, `python3 --version` ≥ 3.11, `~/messages/logs/` exists |
+| 2 | Phone normalization works | automated | Add rows with mixed phone formats to test CSV; run `--dry-run` | All phones printed in E.164 format in preview | All phone values in output match `+1XXXXXXXXXX` pattern |
+| 3 | Service type auto-detected | automated | Run `python ~/bin/detect_service.py`; inspect contacts.csv | `service_type` column populated for contacts with existing threads | No empty `service_type` for active contacts with prior threads |
+| 4 | Pre-flight passes for all valid contacts | automated | `python ~/bin/send_messages.py --csv ~/messages/contacts.csv --dry-run` | Output contains `Pre-flight OK — N contacts verified` | exit 0, no PRE-FLIGHT FAILED lines |
+| 5 | Pre-flight halts on missing thread | automated | Add a test row with a phone number that has no Messages.app thread; run `--dry-run` | Output contains `PRE-FLIGHT FAILED` with the test contact's name and phone | exit non-zero, no send attempts logged |
+| 6 | Inactive contacts skipped | automated | Set one contact to `active = no`; run `--dry-run` | That contact does not appear in preview or pre-flight output | Preview count = active contacts only |
+| 7 | Dry-run preview works | automated | `python ~/bin/send_messages.py --dry-run` (all contacts valid) | Prints one line per active contact with personalized message body from template | exit 0, output contains correct first_name and greeting per row |
+| 8 | iMessage send succeeds | manual | Run without `--dry-run` with one iMessage test contact in CSV | Message appears in Messages.app as blue bubble | exit 0, blue bubble visible in Messages.app thread |
+| 9 | SMS send succeeds | manual | Run with one SMS test contact in CSV | Message appears in Messages.app as green bubble | exit 0, green bubble visible in Messages.app thread |
+| 10 | Failed send auto-retries, batch continues | automated | Add a test contact with an invalid phone number (e.g. `+10000000000`) to CSV; run without `--dry-run` | 15s pause observed; retry attempted; retry log created with that contact; remaining contacts still sent | `retry_YYYY-MM-DD.csv` non-empty with error column; send_log contains other contacts with status=sent |
+| 11 | Failure list printed at end | automated | Same as test 10 | Terminal output ends with consolidated list of failed contacts and their errors | output contains failed contact's name + error after `Failed after retry:` line |
+| 12 | Retry log is re-usable as CSV input | automated | `python ~/bin/send_messages.py --csv ~/messages/logs/retry_$(date +%Y-%m-%d).csv --dry-run` | Dry-run preview prints the failed contact's row | exit 0, output contains failed contact's first_name |
+| 13 | Send log generated | automated | `ls ~/messages/logs/send_$(date +%Y-%m-%d).csv` | File exists after run | exit 0, file non-empty |
+| 14 | Delivery report generated | automated | `python ~/bin/delivery_report.py && cat ~/messages/logs/delivery_$(date +%Y-%m-%d).csv` | CSV with is_delivered column | exit 0, is_delivered = 1 for sent contacts after 60s |
+| 15 | Skill invocable | manual | Invoke `/imessage-blast` in Claude Code | Guided workflow prompts appear without error | Skill executes pre-flight check step without crashing |
+| 16 | Rate limiting active | automated | Check send_log timestamps | 10+ seconds between consecutive send entries | All consecutive timestamp deltas ≥ 10 seconds |
+| 17 | Tahoe osascript compatibility | manual (POC gate) | Send one iMessage and one SMS to test contacts on macOS Tahoe | Both messages delivered; no osascript errors | POC passes before full build begins |
+
+---
+
+### Decision Log
+
+| Decision | Rationale | Research Finding | Alternatives Rejected | Risks |
+|----------|-----------|------------------|-----------------------|-------|
+| Use `subprocess` + `osascript` directly (no Python iMessage library) | Most durable; avoids library rot across macOS updates | `py-iMessage` and similar libs wrap osascript anyway; direct approach removes one failure layer (External: Python approaches) | `py-iMessage`, `imsg` CLI | osascript API may change in future macOS versions; Tahoe compatibility unconfirmed until POC |
+| Auto-detect `service_type` from `chat.db` `handle.service` column | Teacher cannot reliably determine iMessage vs SMS; manual maintenance error-prone | `handle` table `service` column is populated from actual message history — more reliable than user judgment (External: Service type auto-detection) | Manual `service_type` column maintenance | Requires existing thread (pre-flight already enforces this); must re-run when contacts change devices |
+| Normalize all phone numbers to E.164 at CSV read time | Contacts.app stores numbers in mixed formats; `chat.db` handle lookups are exact-match — format mismatch causes silent pre-flight failures | Mixed format confirmed by user; `phonenumbers` library handles all common US formats (External: Phone normalization) | Require teacher to enter E.164 manually | `phonenumbers` lib adds a pip dependency; handles edge cases better than regex |
+| Template file over `--message TEXT` flag | Teacher edits the same body each week — a file is easier than re-typing at CLI; supports multi-line bodies | User-confirmed preference for template file (Q&A session 2026-05-09) | `--message TEXT` CLI argument; per-contact body in CSV | Teacher must remember to edit template before each run; skill will prompt her |
+| Auto-retry once after 15-second pause; then log failure | A single transient failure (Messages.app busy, brief network hiccup) should not require manual intervention; 15s gives Messages.app time to recover | User-confirmed retry behavior (Q&A session 2026-05-09) | Abort on first failure; skip failures silently; retry immediately (no pause) | Double-send risk if first attempt actually delivered but appeared to fail; mitigated by `chat.db` delivery log review |
+| `is_delivered` as primary confirmation signal, `is_read` as bonus | `is_read` requires recipient to have "Send Read Receipts" enabled — unreliable | Many users disable read receipts; `is_delivered` is always populated for successful delivery (External: Delivery confirmation) | `is_read` as primary | `is_delivered` confirms carrier receipt, not actual screen display |
+| One `osascript` call per recipient, never batched | Prevents group-send API confusion; isolates failures to a single contact; aligns with intended one-to-one messaging model | Individual send is the standard AppleScript Messages pattern (External: AppleScript capabilities) | Multi-recipient osascript call | Slightly slower than batching, but failure isolation is worth the tradeoff |
+| POC-first scope | Prove osascript → Messages.app → chat.db round-trip works on Tahoe before building full CLI | No existing internal tooling; Tahoe compatibility unverified (Internal: Gaps; Context: Constraints) | Full-scope | If Tahoe broke osascript, the approach must be reconsidered before any further build |
+| Pre-flight check queries `chat.db` before any send | Silent failures (osascript reports success but message never arrives) are undetectable after the fact if no thread exists; blocking before send is the only reliable gate | Existing conversation restriction — scripted sends to contacts with no thread can silently fail (External: AppleScript limitations) | Post-send validation only (too late to prevent a failed batch) | Pre-flight reads `chat.db` directly — requires Full Disk Access permission already required by REQ-6; no new permission needed |
+| Dedicated `setup.sh` onboarding script | Teacher has no pre-installed deps; must be able to set up the full environment from scratch without Terminal expertise | Stock macOS Tahoe + Claude Code only; confirmed in Q&A (Q&A session 2026-05-09) | Manual installation guide (too error-prone for non-technical user) | Homebrew installer requires internet access and may prompt for admin password |
+
+---
+
+### Efficacy Targets
+
+| # | What to measure | How to measure | Target value | Autonomous action if below target |
+|---|----------------|----------------|-------------|-----------------------------------|
+| 1 | Pre-flight passes for all active contacts | `python ~/bin/send_messages.py --dry-run 2>&1 \| grep -c "Pre-flight OK"` | output = 1 (exactly one OK line; 0 means check did not run or failed) | Re-verify chat.db path + Full Disk Access permission → retry once → escalate |
+| 2 | Dry-run exits cleanly | `python ~/bin/send_messages.py --dry-run; echo $?` | exit 0 (any non-zero = script error) | Re-read script, fix syntax/import error → retry once → escalate |
+| 3 | iMessage send succeeds for test contact | Check Messages.app thread + send_log entry | `status = sent` in send_log (script-level confirmation; non-zero osascript exit = failure) | Verify Automation permission granted → retry once → escalate |
+| 4 | Delivery log shows is_delivered for iMessage test | Query chat.db 60s post-send | `is_delivered = 1` for test contact row | Extend wait to 120s → retry query → escalate if still 0 |
+| 5 | No consecutive timestamp deltas < 10s in send_log | `awk -F',' 'NR>1{print $1}' send_log.csv \| sort \| awk 'prev{diff=$0-prev; if(diff<10) print "VIOLATION: "diff} {prev=$0}'` | No VIOLATION output | Auto-fix: increase default delay → re-run dry-run verification |
+
+**Autonomous refinement policy:** max 2 retries per target; beyond this, surface to user with failure evidence and diff.
+
+---
+
+### Convergence Criteria
+
+```yaml
+scope_disposition: poc
+convergence_type: code
+probes:
+  - id: probe-tahoe-compat
+    command: "python ~/bin/send_messages.py --csv ~/messages/contacts_test.csv --message 'POC test: {greeting}' 2>&1"
+    pass_condition: "exit 0 and no osascript errors; message visible in Messages.app on macOS Tahoe"
+    type: manual
+  - id: probe-preflight
+    command: "python ~/bin/send_messages.py --csv ~/messages/contacts_test.csv --dry-run 2>&1 | grep 'Pre-flight'"
+    pass_condition: "output contains 'Pre-flight OK' and no 'PRE-FLIGHT FAILED' lines"
+    type: code
+  - id: probe-dry-run
+    command: "python ~/bin/send_messages.py --csv ~/messages/contacts_test.csv --dry-run"
+    pass_condition: "exit 0 and stdout contains personalized first_name and greeting for each active row"
+    type: code
+  - id: probe-imessage-send
+    command: "python ~/bin/send_messages.py --csv ~/messages/contacts_test.csv"
+    pass_condition: "exit 0 and send_log contains status=sent for iMessage test contact"
+    type: code
+  - id: probe-delivery-query
+    command: "sleep 60 && python ~/bin/delivery_report.py"
+    pass_condition: "exit 0 and delivery_report CSV contains is_delivered=1 for iMessage test contact"
+    type: code
+max_iterations: 10
+mutation_policy: guided
+```
+
+---
+
+### Problem Shape
+
+```yaml
+pattern: ""
+approach: ""
+proof: ""
+boundary: ""
+variance: ""
+fan_out_candidates: []
+```
+
+---
+
+### Open Questions
+
+- [ ] Tahoe osascript compatibility must be confirmed during POC — if Messages.app scripting is broken on macOS 16, the approach must be reconsidered before full implementation.
+- [ ] Should the skill support re-sending only to failed/undelivered recipients from a previous run? (auto-retry is now built in; this question is about cross-session retry from delivery report.)
+
+---
+
+## Features
+
+```yaml
+- id: onboarding-script
+  description: "setup.sh installs all dependencies and configures the environment from scratch on stock macOS Tahoe"
+  verify_intent: "Run setup.sh on a machine with only Claude Code. Confirm Python 3.11+ is installed, ~/messages/logs/ exists, contacts.csv and message_template.txt are created with correct defaults, and the permission grant instructions are printed with correct System Settings deep links."
+  milestone: false
+  depends_on: []
+
+- id: contact-csv
+  description: "Contacts CSV with defined schema is populated from macOS Contacts app and editable in Numbers/Excel"
+  verify_intent: "Open contacts.csv in Numbers. Confirm it has columns first_name, last_name, phone, service_type, custom_greeting, active. Confirm at least one row is populated correctly from an actual contact."
+  milestone: false
+  depends_on: [onboarding-script]
+
+- id: service-type-detection
+  description: "detect_service.py auto-populates service_type in contacts.csv from chat.db without teacher input"
+  verify_intent: "Run detect_service.py with a contacts.csv that has empty service_type values. Confirm the script updates each active contact's service_type to imessage or sms based on chat.db history. Confirm contacts with no prior thread are flagged but not errored."
+  milestone: false
+  depends_on: [contact-csv]
+
+- id: phone-normalization
+  description: "All phone numbers normalized to E.164 before any chat.db lookup or osascript call"
+  verify_intent: "Add contacts with mixed phone formats (local, with dashes, without country code) to contacts_test.csv. Run --dry-run. Confirm all phone numbers in the preview output appear in E.164 format. Confirm pre-flight succeeds for contacts whose chat.db records are stored in E.164."
+  milestone: false
+  depends_on: [contact-csv]
+
+- id: preflight-check
+  description: "send_messages.py pre-flight verifies every active contact has an existing Messages.app thread before any send occurs"
+  verify_intent: "Run the script with --dry-run against the contacts CSV. Confirm the output shows 'Pre-flight OK — N contacts verified'. Then temporarily add a row with a fake phone number and re-run — confirm the script prints 'PRE-FLIGHT FAILED' with that contact's name and exits without showing any message previews."
+  milestone: false
+  depends_on: [phone-normalization, service-type-detection]
+
+- id: dry-run-preview
+  description: "send_messages.py --dry-run prints a personalized preview for every active contact without sending"
+  verify_intent: "Run the script with --dry-run (all contacts must pass pre-flight first). Confirm no messages appear in Messages.app. Confirm the terminal output shows one line per active contact with the correct first_name and custom_greeting values from the CSV, combined with the message_template.txt body."
+  milestone: false
+  depends_on: [preflight-check]
+
+- id: personalized-send
+  description: "send_messages.py sends a personalized message to each active contact individually, auto-retrying failures once before writing to retry log"
+  verify_intent: "Run the full send. Confirm pre-flight passes first ('Pre-flight OK' in output). Open Messages.app. Confirm each active contact received a message with their specific greeting and the template body. Confirm iMessage contacts show blue bubble, SMS contacts show green bubble. Check send_log CSV — successful sends show status=sent or status=sent_after_retry. Confirm that any simulated failure (bad phone number) was retried after 15s, then written to retry_YYYY-MM-DD.csv, and that the rest of the batch completed. Confirm a consolidated failure list was printed at the end."
+  milestone: true
+  depends_on: [dry-run-preview]
+
+- id: retry-log
+  description: "Failed sends after retry are written to retry_YYYY-MM-DD.csv with error details; the file is usable as direct --csv input to re-send only failures"
+  verify_intent: "After a run that includes one intentionally invalid contact, confirm retry_YYYY-MM-DD.csv exists and contains that contact's row with a non-empty error column. Confirm the log has the same columns as contacts.csv plus error. Then run send_messages.py --csv retry_YYYY-MM-DD.csv --dry-run and confirm it previews only the failed contact."
+  milestone: false
+  depends_on: [personalized-send]
+
+- id: delivery-log
+  description: "delivery_report.py produces a CSV with is_delivered status for every recipient from the most recent send"
+  verify_intent: "Run delivery_report.py 60 seconds after a send. Open the delivery CSV. Confirm each contact has an is_delivered value (1 for success). iMessage contacts may also show is_read=1 if they have read receipts enabled."
+  milestone: false
+  depends_on: [retry-log]
+
+- id: imessage-blast-skill
+  description: "/imessage-blast skill guides the teacher through the weekly workflow without Terminal knowledge"
+  verify_intent: "Invoke /imessage-blast in Claude Code. Confirm the skill presents these steps in order: service type check (offer to run detect_service.py if needed), CSV check, pre-flight verification (with clear pass/fail output), dry-run preview with template content, confirmation prompt, send, delivery report, failure summary (if any). Confirm the teacher can complete the full weekly workflow without typing any commands directly."
+  milestone: false
+  depends_on: [delivery-log]
+```
+
+---
+
+## Grants
+
+```yaml
+file_edits:
+  - "~/bin/setup.sh"
+  - "~/bin/send_messages.py"
+  - "~/bin/detect_service.py"
+  - "~/bin/delivery_report.py"
+  - "~/messages/contacts.csv"
+  - "~/messages/contacts_test.csv"
+  - "~/messages/message_template.txt"
+  - "~/messages/logs/**"
+  - "~/.claude/skills/imessage-blast/**"
+commands:
+  - "python"
+  - "python3"
+  - "osascript"
+  - "sqlite3"
+  - "brew"
+  - "pip"
+  - "pip3"
+  - "bash"
+  - "ls"
+  - "cat"
+  - "awk"
+  - "sleep"
+  - "open"
+```
+
+---
+
+## Defaults
+
+```yaml
+on_ambiguity: pick_simpler
+on_missing_test: create_it
+on_conflict: fail_fast_log
+on_missing_dependency: install_it
+max_retries: 3
+max_iterations: 10
+mutation_policy: guided
+fan_out_depth: 0
+```
