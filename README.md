@@ -15,6 +15,8 @@ git clone https://github.com/rafael-alvarez-001/iMessage-bulk-sender.git
 cd iMessage-bulk-sender
 ```
 
+> Get the URL from whoever shared this repo with you.
+
 ### Step 2 — Run the setup script
 
 ```bash
